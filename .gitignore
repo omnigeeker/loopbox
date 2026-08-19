@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# LoopX control-plane state (local, never committed)
+.loopx/
+.codex/goals/
+.local/
+
+# Loopbox runtime state
+.loopbox/
+.loopbox-smoke/
+
+# Test caches
+.pytest_cache/
+
+# OS noise
+.DS_Store
+
+# VZ runner build artifacts
+vzrunner/.build/

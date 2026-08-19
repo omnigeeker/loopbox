@@ -1,0 +1,41 @@
+"""Unit tests for Seatbelt profile generation."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from loopbox.backends.seatbelt import SENSITIVE_DENY_READ, build_profile
+
+
+def test_profile_denies_default_and_grants_workspace(tmp_path):
+    ws = tmp_path / "ws"
+    profile = build_profile(ws)
+    assert "(deny default)" in profile
+    assert f'(allow file-read* file-write* (subpath "{ws}"))' in profile
+
+
+def test_sensitive_paths_always_denied(tmp_path):
+    profile = build_profile(tmp_path / "ws")
+    for path in SENSITIVE_DENY_READ:
+        expanded = str(Path(path).expanduser())
+        assert f'(deny file-read* file-write* (subpath "{expanded}"))' in profile
+
+
+def test_network_modes(tmp_path):
+    assert "(allow network-outbound)" in build_profile(tmp_path, network="outbound")
+    assert "(allow network*)" in build_profile(tmp_path, network="all")
+    denied = build_profile(tmp_path, network="deny")
+    assert "(deny network*)" in denied
+    assert "(allow network" not in denied
+
+
+def test_unknown_network_mode_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        build_profile(tmp_path, network="sometimes")
+
+
+def test_extra_rw_paths(tmp_path):
+    profile = build_profile(tmp_path / "ws", extra_rw=["~/build-cache"])
+    assert f'(subpath "{Path("~/build-cache").expanduser()}")' in profile

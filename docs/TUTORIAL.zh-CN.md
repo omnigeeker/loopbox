@@ -110,20 +110,20 @@ curl -X POST localhost:31885/sandboxes/<sandboxID>/exec -H "X-API-Key: $KEY" \
 `/snapshots`、`GET|PUT /files`），鉴权头也是 E2B 同款 `X-API-Key`——
 现有 E2B 客户端换个 base URL 就能指向本机。`GET /health` 无需鉴权，可直接探活。
 
-## 第 4 步：让 Codex / Claude Code / DSH 在沙箱里跑
+## 第 4 步：让 Codex / Kimi Code 在沙箱里跑
 
 harness 跑在一个先建好的沙箱里；`run` 把 `--` 之后的参数原样透传给 harness CLI：
 
 ```bash
 SID=$(loopbox new)                         # harness 进程的沙箱
 loopbox harness list                       # 已知 harness CLI 及检测状态
-loopbox harness describe codex             # 某个 harness 的适配说明与启动示例
+loopbox harness describe kimi              # 某个 harness 的适配说明与启动示例
 loopbox harness doctor                     # 装了哪些 harness + 接入指引
 
-loopbox harness run $SID codex  -- exec "fix the failing tests"
-loopbox harness run $SID claude -- -p "summarise this repo"
-loopbox harness run $SID dsh    -- cli     # DeepSeek Harness 交互式终端
-loopbox harness run $SID <任意二进制名> -- ...   # 自定义 harness（按 PATH 上的名字）
+loopbox harness run $SID codex -- exec "fix the failing tests"
+loopbox harness run $SID kimi  -- -p "review this repo"    # Kimi Code 无头模式
+loopbox harness run --interactive $SID kimi                # 交互会话托管为常驻进程
+loopbox harness run $SID <任意二进制名> -- ...             # 自定义 harness（按 PATH 上的名字）
 ```
 
 此刻 harness 进程被 Seatbelt 约束：能读工具链、能联网（默认 `outbound`），
@@ -163,8 +163,7 @@ loopx start-goal --guided --project . --goal-text \
 | 宿主 | 驱动方式 |
 | --- | --- |
 | Codex CLI | 在项目根启动 `codex`，让它跑 `loopx doctor`；用 `$loopx <任务>` 或 `/skills` 里的 loopx 技能维持循环体 |
-| Claude Code | 先 `loopx slash-commands --install` 安装技能，再用 `/loopx <任务>` + `/loop` |
-| DSH | 用 `loopx new-project-prompt` 生成「Connect this repo to LoopX」提示词贴给它 |
+| Kimi Code | 用 `loopx new-project-prompt` 生成「Connect this repo to LoopX」提示词贴给它；配合 `/goal` 目标模式维持长期循环 |
 | 本仓库自带引擎 | `loopbox loop` 直接跑「自检 → 规划 → 执行 → 验证」循环（见第 6 步） |
 
 LoopX 会让 Loop **可持续**：配额（quota）决定下一次 tick 是否该跑、
@@ -213,8 +212,9 @@ loopbox loop history <loop_id>
 ```
 
 `loopbox loop run` 的退出码：`0` 目标达成，`1` 失败，`2` 预算耗尽或运行被
-中断，`3` 有 Gate 等待人工处理。装了 `codex` 或 `claude` 时「思考」步骤会交给
-对应 CLI（可用 `LOOPBOX_HARNESS="cmd {prompt}"` 覆盖，`LOOPBOX_HARNESS_TIMEOUT`
+中断，`3` 有 Gate 等待人工处理。装了 `codex`、`kimi` 或 `claude` 时「思考」步骤会
+交给对应 CLI（按 codex → kimi → claude 顺序探测；可用
+`LOOPBOX_HARNESS="kimi -p {prompt}"` 这类形式覆盖，`LOOPBOX_HARNESS_TIMEOUT`
 调超时）；都没有则退回确定性规则兜底，并把需要判断的决策一律升级给 Gate。
 
 ## 第 7 步：验证 Loop 在正确运转

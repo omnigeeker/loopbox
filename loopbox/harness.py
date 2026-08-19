@@ -1,15 +1,16 @@
 """Adapters that run agent harness CLIs inside loopbox sandboxes.
 
-A *harness* is an agent-facing CLI (OpenAI Codex, Claude Code, DeepSeek
-Harness, ...). Harnesses choose their runtime by where they execute: if you
-start ``codex`` on the host, codex's own sandbox is all that protects the
-host. Loopbox therefore runs the *whole* harness CLI inside a sandbox by
-passing the harness argv to :meth:`Backend.exec` / :meth:`Backend.spawn`
-with the sandbox workspace as cwd, so the outer loopbox boundary (Seatbelt
-profile or VM) applies no matter how the harness is configured internally:
+A *harness* is an agent-facing CLI (OpenAI Codex, Kimi Code, Claude Code,
+DeepSeek Harness, ...). Harnesses choose their runtime by where they
+execute: if you start ``codex`` on the host, codex's own sandbox is all that
+protects the host. Loopbox therefore runs the *whole* harness CLI inside a
+sandbox by passing the harness argv to :meth:`Backend.exec` /
+:meth:`Backend.spawn` with the sandbox workspace as cwd, so the outer
+loopbox boundary (Seatbelt profile or VM) applies no matter how the harness
+is configured internally:
 
     loopbox harness run <sbx_id> codex -- exec "fix the failing tests"
-    loopbox harness run <sbx_id> claude --interactive
+    loopbox harness run <sbx_id> kimi -- -p "review this repo"
     loopbox harness doctor
 """
 
@@ -110,6 +111,18 @@ _DSH_NOTES = (
     "confirm with `dsh --help` for the installed version."
 )
 
+_KIMI_NOTES = (
+    "Kimi Code CLI (`kimi`). Bare `kimi` starts the interactive session; "
+    "`kimi -p \"prompt\"` (or `--prompt`) runs one prompt non-interactively "
+    "and prints the response. Permission control is by mode: default asks, "
+    "`-y/--yolo` auto-approves regular tool calls (the agent may still ask "
+    "questions), and `--auto` runs fully autonomously -- reserve full-autonomy "
+    "modes for runs inside a loopbox sandbox, never on the host. `kimi` also "
+    "ships `kimi doctor` (config validation), `kimi web` (local web UI), and "
+    "an ACP server mode (`kimi acp`). Under loopbox, the outer Seatbelt "
+    "profile or VM stays the boundary regardless of the chosen mode."
+)
+
 
 KNOWN_HARNESSES: dict[str, HarnessSpec] = {
     spec.name: spec
@@ -123,6 +136,16 @@ KNOWN_HARNESSES: dict[str, HarnessSpec] = {
                 "--interactive   # full TUI inside the sandbox",
             ),
             install_hint="npm install -g @openai/codex",
+        ),
+        HarnessSpec(
+            name="kimi",
+            binary="kimi",
+            notes=_KIMI_NOTES,
+            launch_examples=(
+                '-p "summarise this repo"   # headless one-shot',
+                "--interactive             # REPL spawned inside the sandbox",
+            ),
+            install_hint="see https://github.com/MoonshotAI/kimi-code",
         ),
         HarnessSpec(
             name="claude",
@@ -290,8 +313,9 @@ How to point a harness at loopbox as its runtime:
   harness CLI inside a sandbox:
 
       loopbox harness run <sbx_id> codex -- exec --sandbox workspace-write "task"
+      loopbox harness run <sbx_id> kimi -- -p "task"
+      loopbox harness run <sbx_id> kimi --interactive
       loopbox harness run <sbx_id> claude -- -p "task"
-      loopbox harness run <sbx_id> claude --interactive
       loopbox harness run <sbx_id> dsh -- cli
 
   inside the sandbox, writes are confined to the workspace (plus scratch
@@ -368,7 +392,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="loopbox harness",
-        description="Run agent harness CLIs (codex, claude, dsh, custom) inside loopbox sandboxes.",
+        description="Run agent harness CLIs (codex, kimi, claude, dsh, custom) inside loopbox sandboxes.",
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
 

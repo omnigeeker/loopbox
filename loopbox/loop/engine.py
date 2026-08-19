@@ -4,8 +4,9 @@ The engine runs a LoopX-style control loop over a durable ledger
 (:mod:`loopbox.loop.state`):
 
 - **self-think**: review the ledger and propose the next action. Thinking is
-  delegated to an agent-harness CLI (``codex`` or ``claude``, override via
-  ``LOOPBOX_HARNESS``) when one is on ``PATH``; otherwise a structured
+  delegated to an agent-harness CLI (``codex``, ``kimi`` or ``claude``,
+  override via ``LOOPBOX_HARNESS``) when one is on ``PATH``; otherwise a
+  structured
   rule-based fallback produces the plan and escalates judgment to human
   gates.
 - **self-check**: execute the proposed command *inside a loopbox sandbox*
@@ -127,6 +128,8 @@ def _find_harness() -> list[str] | None:
         return shlex.split(override)
     if shutil.which("codex"):
         return ["codex", "exec"]
+    if shutil.which("kimi"):
+        return ["kimi", "-p"]
     if shutil.which("claude"):
         return ["claude", "-p"]
     return None
@@ -274,7 +277,7 @@ def _rule_decision(ledger: dict[str, Any], todo: dict[str, Any]) -> dict[str, An
         {
             "action": "ask_human",
             "question": (
-                "No LLM harness found (set LOOPBOX_HARNESS or install codex/claude). "
+                "No LLM harness found (set LOOPBOX_HARNESS or install codex/kimi/claude). "
                 f"How should the loop proceed on todo {todo['id']} ({todo['title']!r})? "
                 "Steer with a note like 'run: <command>' to enqueue work, or approve "
                 "to close this todo."

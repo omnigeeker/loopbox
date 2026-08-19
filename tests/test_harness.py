@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(
 def test_list_available_structure():
     entries = harness.list_available()
     names = [e["name"] for e in entries]
-    assert names == ["codex", "claude", "dsh"]
+    assert names == ["codex", "kimi", "claude", "dsh"]
     for entry in entries:
         assert set(entry) == {"name", "binary", "installed", "path", "notes"}
         assert entry["binary"] == entry["name"]
@@ -117,7 +117,7 @@ def test_harness_main_list(capsys):
     rc = harness.harness_main(["list"])
     assert rc == 0
     out = capsys.readouterr().out
-    for name in ("codex", "claude", "dsh"):
+    for name in ("codex", "kimi", "claude", "dsh"):
         assert name in out
 
 

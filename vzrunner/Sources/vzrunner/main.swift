@@ -432,51 +432,53 @@ final class VMManager {
         }
     }
 
-    /// Read one request from an accepted client, run it as a Task on the main
-    /// queue, then reply and close. VZ ops are async/block callbacks and, under
-    /// dispatchMain(), `await`-ing them resumes on this same main queue safely.
+    /// Read one request from an accepted client (on the background accept
+    /// thread), then hop to the main queue as a Task so VZ ops run on the queue
+    /// that owns the VM. The reply and close happen from that Task, so the
+    /// background accept loop is free to service the next client.
     private func serve(client: Int32) {
-        Task {
+        Task { @MainActor [self] in
             defer { Darwin.close(client) }
             do {
                 let line = try UnixSocket.readLine(fd: client)
                 if line.trimmingCharacters(in: .whitespaces).isEmpty {
-                    respond(fd: client, ["ok": false, "error": "empty request"])
+                    self.respond(fd: client, ["ok": false, "error": "empty request"])
                     return
                 }
                 let req = try Wire.parse(line)
                 let op = req["op"] as? String ?? ""
                 switch op {
                 case "status":
-                    var info: [String: Any] = ["ok": true, "pid": getpid(), "state": machineStateString()]
+                    var info: [String: Any] = ["ok": true, "pid": getpid(), "state": self.machineStateString()]
                     if let bootError = self.bootError { info["boot_error"] = bootError }
-                    respond(fd: client, info)
+                    self.respond(fd: client, info)
                 case "pause":
-                    try await pauseVM()
-                    respond(fd: client, ["ok": true])
+                    try await self.pauseVM()
+                    self.respond(fd: client, ["ok": true])
                 case "resume":
-                    try await resumeVM()
-                    respond(fd: client, ["ok": true])
+                    try await self.resumeVM()
+                    self.respond(fd: client, ["ok": true])
                 case "snapshot":
                     let name = req["name"] as? String ?? "snapshot"
-                    try await snapshotVM(name: name)
-                    respond(fd: client, ["ok": true, "name": name])
+                    try await self.snapshotVM(name: name)
+                    self.respond(fd: client, ["ok": true, "name": name])
                 case "restore":
                     let name = req["name"] as? String ?? "snapshot"
-                    try restoreVM(name: name)
-                    respond(fd: client, ["ok": true])
+                    try self.restoreVM(name: name)
+                    self.respond(fd: client, ["ok": true])
                 case "kill":
-                    respond(fd: client, ["ok": true])
-                    shutdown()
+                    self.respond(fd: client, ["ok": true])
+                    self.shutdown()
                 default:
-                    respond(fd: client, ["ok": false, "error": "unknown op \(op)"])
+                    self.respond(fd: client, ["ok": false, "error": "unknown op \(op)"])
                 }
             } catch {
-                respond(fd: client, ["ok": false, "error": error.localizedDescription])
+                self.respond(fd: client, ["ok": false, "error": error.localizedDescription])
             }
         }
     }
 
+    @MainActor
     private func machineStateString() -> String {
         guard let vm = machine else { return "absent" }
         switch vm.state {
@@ -498,11 +500,13 @@ final class VMManager {
     // pause() / resume() are `NS_REFINED_FOR_SWIFT` (Swift `async`), and
     // saveMachineStateTo keeps a completion-block form (bridged below).
 
-    // The async VZ calls resume their continuations on the main queue; since
-    // serve() runs handlers as Tasks on that same queue under dispatchMain(),
-    // `await`-ing pause/resume/save here is the proven-safe pattern on this host
-    // (macOS 26 / Swift 6.3): no nested runloop re-entry, no cross-thread trap.
+    // VZ requires these on the dispatch queue that owns the VM (the main queue
+    // here). Marking them @MainActor makes their Tasks hop onto the main actor;
+    // on this host, awaiting a VZ call from any other thread traps with
+    // dispatch_assert_queue. iso3 (blocking accept off-main, VZ on @MainActor)
+    // pauses cleanly without crashing.
 
+    @MainActor
     private func pauseVM() async throws {
         guard let vm = machine, vm.canPause else {
             throw VZRError.vm("VM is not in a pausable state (state=\(machineStateString()))")
@@ -510,6 +514,7 @@ final class VMManager {
         try await vm.pause()
     }
 
+    @MainActor
     private func resumeVM() async throws {
         guard let vm = machine, vm.canResume else {
             throw VZRError.vm("VM is not paused (state=\(machineStateString()))")
@@ -518,6 +523,7 @@ final class VMManager {
     }
 
     /// Bridge the completion-block saveMachineStateTo into async on the main queue.
+    @MainActor
     private func saveMachineState(to url: URL) async throws {
         guard let vm = machine else { throw VZRError.vm("no VM running") }
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
@@ -528,6 +534,7 @@ final class VMManager {
         }
     }
 
+    @MainActor
     private func snapshotVM(name: String) async throws {
         guard machine != nil else { throw VZRError.vm("no VM running") }
         if #available(macOS 14.0, *) {
@@ -560,6 +567,7 @@ final class VMManager {
     /// the next exec boots from the restored state. The saved machine-state
     /// blob at <name>/machine-state is the authoritative whole-VM checkpoint
     /// and is consumed by a boot-time restore (see README "Snapshots").
+    @MainActor
     private func restoreVM(name: String) throws {
         if #available(macOS 14.0, *) {
             let stateURL = bundle.machineState(name)
@@ -578,11 +586,11 @@ final class VMManager {
         }
     }
 
+    @MainActor
     private func shutdown() {
         let vm = machine
         // Tear down socket + pidfile, stop the VM, then schedule process exit so
         // the "ok" reply already written by serve() is flushed to the client.
-        acceptSource?.cancel()
         try? FileManager.default.removeItem(at: bundle.socket)
         try? FileManager.default.removeItem(at: bundle.pidfile)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
@@ -613,6 +621,7 @@ struct CLIArgs {
     var bundle: String = ""
     var name: String = ""
     var logLevel: String = "info"
+    var execLine: String = ""
     var commandArgv: [String] = []
 
     static func parse(_ argv: [String]) throws -> CLIArgs {
@@ -650,6 +659,10 @@ struct CLIArgs {
                 out.name = try value(); i += 2
             case "--log-level":
                 out.logLevel = try value(); i += 2
+            case "--exec":
+                // Internal: run-manager only. The pre-quoted guest command line
+                // that boot uses as its init= shim (built by the exec front-end).
+                out.execLine = try value(); i += 2
             default:
                 throw VZRError.usage("unknown flag \(flag)\n\(CLIArgs.usageText())")
             }
@@ -707,10 +720,11 @@ func managerAlive(bundle: BundlePaths) -> Bool {
 
 /// Daemonize a new `vzrunner run-manager` for this bundle.
 ///
-/// Swift forbids `fork()`, so we double-`posix_spawn` instead. The intermediate
-/// child is `setsid`-detached and exits immediately; that orphans the real
-/// manager process so launchd adopts it and the short-lived `exec` front-end can
-/// return while the manager keeps owning the bundle's VZVirtualMachine.
+/// Swift forbids `fork()`, so we `posix_spawn` the manager directly and rely on
+/// it calling `setsid()` in run-manager; once this (short-lived) front-end exits,
+/// the manager is reparented to launchd and keeps owning the bundle's
+/// VZVirtualMachine. Stdio is redirected to /dev/null so the manager never holds
+/// our pipes or stdio.
 func spawnManager(bundle: BundlePaths, execLine: String?, logLevel: String) throws {
     let selfPath = URL(fileURLWithPath: CommandLine.arguments[0]).path
     var managerArgv = ["run-manager", "--bundle", bundle.root.path, "--log-level", logLevel]
@@ -718,13 +732,9 @@ func spawnManager(bundle: BundlePaths, execLine: String?, logLevel: String) thro
         managerArgv.append(contentsOf: ["--exec", execLine])
     }
 
-    // Detach the manager's stdio to /dev/null so it never holds our pipes. The
-    // manager calls setsid() itself inside run-manager, so after we exit the
-    // process is reparented to launchd and keeps owning the VM.
+    // Redirect the manager's stdio to /dev/null so it never holds our pipes.
     var attrs: posix_spawnattr_t?
     posix_spawnattr_init(&attrs)
-
-    // Redirect the manager's stdio to /dev/null so it never holds our pipes.
     var fileActions: posix_spawn_file_actions_t?
     posix_spawn_file_actions_init(&fileActions)
     let devnull = "/dev/null"
@@ -734,11 +744,12 @@ func spawnManager(bundle: BundlePaths, execLine: String?, logLevel: String) thro
 
     var pid = pid_t()
     var spawnArgv: [UnsafeMutablePointer<CChar>?] = [strdup(selfPath)] + managerArgv.map { strdup($0) } + [nil]
-    let environ: [UnsafeMutablePointer<CChar>?] = [nil]
-    let spawnErr = spawnArgv.withUnsafeMutableBufferPointer { argvBuf -> Int32 in
-        environ.withUnsafeBufferPointer { envBuf -> Int32 in
-            posix_spawn(&pid, selfPath, &fileActions, &attrs, argvBuf.baseAddress, envBuf.baseAddress)
-        }
+    // Pass the process's real environment so the spawned manager inherits
+    // PATH/HOME/etc.; an empty envp makes a barely-usable process that may not
+    // initialize Foundation/Virtualization correctly.
+    var spawnErr = Int32(-1)
+    spawnArgv.withUnsafeMutableBufferPointer { argvBuf in
+        spawnErr = posix_spawn(&pid, selfPath, &fileActions, &attrs, argvBuf.baseAddress, environ)
     }
     posix_spawn_file_actions_destroy(&fileActions)
     posix_spawnattr_destroy(&attrs)
@@ -746,9 +757,7 @@ func spawnManager(bundle: BundlePaths, execLine: String?, logLevel: String) thro
         throw VZRError.manager("posix_spawn(\(selfPath)): \(String(cString: strerror(spawnErr)))")
     }
 
-    // The manager daemonizes itself (setsid + detach) in run-manager, so we
-    // only wait for its control socket to appear; a straight posix_spawn child
-    // is reparented to launchd once we exit.
+    // Wait for the control socket to come up (manager binds it before booting).
     let deadline = Date().addingTimeInterval(15.0)
     while Date() < deadline {
         if managerAlive(bundle: bundle) { return }
@@ -759,19 +768,9 @@ func spawnManager(bundle: BundlePaths, execLine: String?, logLevel: String) thro
 
 // MARK: - run-manager entry point
 
-/// Long-lived manager mode: boots the VM, serves the socket, runs the main
-/// runloop forever so VZ's completion handlers keep firing. Never returns.
-func runManager(bundleArg: String, extraArgs: [String]) throws -> Never {
-    var execLine: String?
-    var i = 0
-    while i < extraArgs.count {
-        if extraArgs[i] == "--exec", i + 1 < extraArgs.count {
-            execLine = extraArgs[i + 1]
-            i += 2
-        } else {
-            i += 1
-        }
-    }
+/// Long-lived manager mode: boots the VM, serves the socket, then parks the
+/// main thread in dispatchMain() forever. Never returns.
+func runManager(bundleArg: String, execLine: String?) throws -> Never {
     let bundle = BundlePaths(root: URL(fileURLWithPath: bundleArg, isDirectory: true))
     let manager = VMManager(bundle: bundle)
 
@@ -802,14 +801,9 @@ func main() throws {
 
     switch args.subcommand {
     case "run-manager":
-        // Internal: re-exec'd by the front-end to own the VM long-term.
-        var extra: [String] = []
-        // Preserve --exec if present (passed positionally after known flags).
-        if let idx = CommandLine.arguments.firstIndex(of: "--exec"),
-           idx + 1 < CommandLine.arguments.count {
-            extra = ["--exec", CommandLine.arguments[idx + 1]]
-        }
-        try runManager(bundleArg: args.bundle, extraArgs: extra)
+        // Internal: re-exec'd by the front-end to own the VM long-term. The
+        // parser already captured --exec (the boot init= shim) for us.
+        try runManager(bundleArg: args.bundle, execLine: args.execLine.isEmpty ? nil : args.execLine)
 
     case "exec":
         guard !args.commandArgv.isEmpty else {
@@ -836,10 +830,17 @@ func main() throws {
             FileHandle.standardError.write("vzrunner: failed to start guest: \(error.localizedDescription)\n".data(using: .utf8)!)
             exit(2)
         }
-        // Streamed output arrives on the manager's own stdout; surface a
-        // minimal acknowledgement so vz.py's exec() returns a string.
-        let state = try sendRequest(bundle: bundle, ["op": "status"])
-        print("vzrunner: guest booted for exec (pid \(state["pid"] ?? "?")); command runs as guest PID 1")
+        // The manager is up and booting; report a best-effort acknowledgement
+        // so vz.py's exec() returns a string. Guest output streams through the
+        // manager's own serial/stdout (see README "Guest-side exec").
+        let pidText: String
+        if let state = try? sendRequest(bundle: bundle, ["op": "status"]),
+           let pid = state["pid"] {
+            pidText = "\(pid)"
+        } else {
+            pidText = "?"
+        }
+        print("vzrunner: guest booted for exec (pid \(pidText)); command runs as guest PID 1")
 
     case "pause":
         _ = try sendRequest(bundle: bundle, ["op": "pause"])

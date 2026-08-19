@@ -412,7 +412,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     check("APFS clonefile support", apfs_ok, apfs_detail)
 
     repo_runner = (
-        Path(__file__).resolve().parent.parent.parent
+        Path(__file__).resolve().parent.parent
         / "vzrunner"
         / ".build"
         / "release"

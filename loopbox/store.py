@@ -13,6 +13,8 @@ half-written registry.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import tempfile
@@ -23,6 +25,7 @@ from typing import Any
 
 ENV_HOME = "LOOPBOX_HOME"
 REGISTRY_FILE = "sandboxes.json"
+LOCK_FILE = ".registry.lock"
 
 
 def home() -> Path:
@@ -56,7 +59,13 @@ class StoreError(Exception):
 
 
 class Store:
-    """JSON-file registry of sandbox records."""
+    """JSON-file registry of sandbox records.
+
+    Reads are lock-free; mutations (add/update/remove) hold an exclusive
+    ``fcntl.flock`` on ``<root>/.registry.lock`` for the whole
+    read-modify-write cycle, so concurrent processes (two CLIs, or a CLI
+    racing the HTTP service's sweeper) never clobber each other's records.
+    """
 
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or home()
@@ -83,16 +92,28 @@ class Store:
             if os.path.exists(tmp):
                 os.unlink(tmp)
 
+    @contextlib.contextmanager
+    def _locked(self):
+        """Serialize one registry mutation across processes."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / LOCK_FILE).open("a+") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
     # -- public API -------------------------------------------------------
 
     def add(self, record: dict[str, Any]) -> dict[str, Any]:
-        data = self._load()
-        sid = record["id"]
-        if sid in data:
-            raise StoreError(f"sandbox {sid} already exists")
-        record.setdefault("created_at", time.time())
-        data[sid] = record
-        self._save(data)
+        with self._locked():
+            data = self._load()
+            sid = record["id"]
+            if sid in data:
+                raise StoreError(f"sandbox {sid} already exists")
+            record.setdefault("created_at", time.time())
+            data[sid] = record
+            self._save(data)
         return record
 
     def get(self, sandbox_id: str) -> dict[str, Any]:
@@ -102,17 +123,19 @@ class Store:
         return data[sandbox_id]
 
     def update(self, sandbox_id: str, **fields: Any) -> dict[str, Any]:
-        data = self._load()
-        if sandbox_id not in data:
-            raise StoreError(f"sandbox {sandbox_id} not found")
-        data[sandbox_id].update(fields)
-        self._save(data)
-        return data[sandbox_id]
+        with self._locked():
+            data = self._load()
+            if sandbox_id not in data:
+                raise StoreError(f"sandbox {sandbox_id} not found")
+            data[sandbox_id].update(fields)
+            self._save(data)
+            return data[sandbox_id]
 
     def remove(self, sandbox_id: str) -> None:
-        data = self._load()
-        data.pop(sandbox_id, None)
-        self._save(data)
+        with self._locked():
+            data = self._load()
+            data.pop(sandbox_id, None)
+            self._save(data)
 
     def list(self) -> list[dict[str, Any]]:
         return sorted(self._load().values(), key=lambda r: r.get("created_at", 0))

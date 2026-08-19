@@ -81,7 +81,10 @@ def build_profile(
         "(deny default)",
         "(debug deny)",
         "",
-        ";; process control, scoped to this sandbox",
+        ";; process control: fork/exec are required for any runtime, so they stay",
+        ";; allowed; process signals stay scoped to this sandbox (process-info*",
+        ";; is unrestricted: macOS 14+ rejects the pname/com.apple.sandbox",
+        ";; target filters as unbound variables, failing the whole profile).",
         "(allow process-fork)",
         "(allow process-exec)",
         "(allow process-info*)",
@@ -161,6 +164,10 @@ class SeatbeltBackend:
     def kill(self, record: dict) -> None:
         engine = record.get("engine") or {}
         for pgid in engine.get("pgids", []):
+            # SIGKILL is not delivered to SIGSTOPped process groups; a pausing
+            # loop left them frozen, so continue them first or kill() would
+            # report success while the sandbox keeps running.
+            self._signal(pgid, signal.SIGCONT)
             self._signal(pgid, signal.SIGKILL)
         engine["pgids"] = []
         # Workspace files are kept on disk for forensics; use `loopbox rm`

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -39,3 +41,19 @@ def test_unknown_network_mode_rejected(tmp_path):
 def test_extra_rw_paths(tmp_path):
     profile = build_profile(tmp_path / "ws", extra_rw=["~/build-cache"])
     assert f'(subpath "{Path("~/build-cache").expanduser()}")' in profile
+
+
+@pytest.mark.skipif(shutil.which("sandbox-exec") is None, reason="requires sandbox-exec")
+def test_generated_profile_loads_in_sandbox_exec(tmp_path):
+    """Regression: target filters like ``(pname ...)`` are unbound on macOS
+    14+ and make sandbox-exec reject the whole profile, breaking everything."""
+    profile_path = tmp_path / "profile.sb"
+    profile_path.write_text(build_profile(tmp_path / "ws"), encoding="utf-8")
+    proc = subprocess.run(
+        ["sandbox-exec", "-f", str(profile_path), "/bin/echo", "profile-ok"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "profile-ok"

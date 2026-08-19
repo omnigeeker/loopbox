@@ -360,14 +360,16 @@ final class VMManager {
         self.bundle = bundle
     }
 
-    /// Bind the control socket, boot the VM, and hand back to the caller.
+    /// Bind the control socket and boot the VM, all on the main thread.
     ///
-    /// Both the socket serving and every VZ call run on the *main* thread via
-    /// `serveLoop()`: on this host, pause/resume/save trap unless they execute
-    /// on the same thread and runloop that started the VM. run() binds the
-    /// socket, boots the guest, marks itself running, and returns; the caller
-    /// then invokes `serveLoop()` on the main thread, which drives one
-    /// non-blocking accept plus one runloop turn per iteration.
+    /// Host constraint (verified on macOS 26 / Swift 6.3): any nested runloop
+    /// re-entry around a VZ lifecycle callback traps in mach-message delivery.
+    /// Working pattern: `vm.start(completionHandler:)` uses the Result-block
+    /// (NOT the `async` import); the main thread then runs `dispatchMain()`;
+    /// the control socket is serviced by a DispatchSource on the main queue so
+    /// every VZ call executes on the same main queue the VM lives on. Async VZ
+    /// calls (pause/resume) are launched as `Task`s from that queue and their
+    /// continuations resume safely under dispatchMain.
     func run(execLine: String?) throws {
         try bundle.ensureLayout()
 
@@ -375,9 +377,6 @@ final class VMManager {
         // serving even if the guest fails to boot, so operators can still run
         // `status`/`kill` against a broken bundle instead of hitting a dead sock.
         serverFD = try UnixSocket.listen(path: bundle.socket.path)
-        // Non-blocking: serveLoop polls the fd between runloop turns.
-        let fl = fcntl(serverFD, F_GETFL)
-        _ = fcntl(serverFD, F_SETFL, fl | O_NONBLOCK)
         writePidfile()
 
         do {
@@ -386,51 +385,45 @@ final class VMManager {
             vm.delegate = delegate
             self.machine = vm
 
-            // Boot the guest. When an exec command line was supplied the guest
-            // runs it as PID 1 (see GuestConfig) and powers itself off on
-            // completion; failures surface through the delegate.
-            vm.start { result in
+            // Boot the guest with the Result-block form (the async `start()`
+            // also traps on this host's runloop delivery, so keep the block).
+            // When an exec command line was supplied the guest runs it as PID 1
+            // and powers itself off on completion; failures hit the delegate.
+            vm.start(completionHandler: { (result: Result<Void, Error>) in
                 if case .failure(let error) = result {
                     FileHandle.standardError.write("boot failed: \(error.localizedDescription)\n".data(using: .utf8)!)
                 }
-            }
+            })
         } catch {
             FileHandle.standardError.write("vzrunner manager: guest not started: \(error.localizedDescription)\n".data(using: .utf8)!)
             self.bootError = error.localizedDescription
         }
 
-        self.isServing = true
+        startServing()
     }
 
-    /// Set by `shutdown()` to end the serve loop after the reply is flushed.
-    var isServing = false
+    /// Serve the control socket with a blocking `accept()` on a background
+    /// thread. Each accepted request is marshalled to the main queue as a Task.
+    ///
+    /// Host constraint (verified): a DispatchSource `accept()` registered on the
+    /// main queue traps when its Task then awaits a VZ lifecycle call, but a
+    /// plain blocking `accept()` on a background thread that hops each request to
+    /// the *main* queue pauses/saves cleanly. So: blocking accept off-main, VZ
+    /// on main, main thread parked in dispatchMain().
+    private func startServing() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            while true {
+                var addr = sockaddr()
+                var len = socklen_t(MemoryLayout<sockaddr>.size)
+                let client = accept(self.serverFD, &addr, &len)
+                guard client >= 0 else { continue }
+                self.serve(client: client)
+            }
+        }
+    }
 
     private func writePidfile() {
         try? "\(getpid())\n".write(to: bundle.pidfile, atomically: true, encoding: .utf8)
-    }
-
-    /// Main-thread serve loop: pump the runloop (for VZ delegate + serial /
-    /// device delivery) and service one pending control connection per turn.
-    /// Everything VZ-related stays on this thread and its runloop context.
-    func serveLoop() {
-        let rl = RunLoop.current
-        while isServing {
-            // Pump pending CFRunLoop sources/timers without blocking forever so
-            // we return quickly to service the control socket.
-            _ = rl.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
-            // Drain any pending connection (non-blocking fd).
-            var addr = sockaddr()
-            var len = socklen_t(MemoryLayout<sockaddr>.size)
-            let client = accept(serverFD, &addr, &len)
-            if client >= 0 {
-                handle(client: client)
-                Darwin.close(client)
-            }
-        }
-        // teardown
-        try? FileManager.default.removeItem(at: bundle.socket)
-        try? FileManager.default.removeItem(at: bundle.pidfile)
-        exit(0)
     }
 
     private func respond(fd: Int32, _ dict: [String: Any]) {
@@ -439,42 +432,48 @@ final class VMManager {
         }
     }
 
-    private func handle(client: Int32) {
-        do {
-            let line = try UnixSocket.readLine(fd: client)
-            if line.trimmingCharacters(in: .whitespaces).isEmpty {
-                respond(fd: client, ["ok": false, "error": "empty request"])
-                return
+    /// Read one request from an accepted client, run it as a Task on the main
+    /// queue, then reply and close. VZ ops are async/block callbacks and, under
+    /// dispatchMain(), `await`-ing them resumes on this same main queue safely.
+    private func serve(client: Int32) {
+        Task {
+            defer { Darwin.close(client) }
+            do {
+                let line = try UnixSocket.readLine(fd: client)
+                if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                    respond(fd: client, ["ok": false, "error": "empty request"])
+                    return
+                }
+                let req = try Wire.parse(line)
+                let op = req["op"] as? String ?? ""
+                switch op {
+                case "status":
+                    var info: [String: Any] = ["ok": true, "pid": getpid(), "state": machineStateString()]
+                    if let bootError = self.bootError { info["boot_error"] = bootError }
+                    respond(fd: client, info)
+                case "pause":
+                    try await pauseVM()
+                    respond(fd: client, ["ok": true])
+                case "resume":
+                    try await resumeVM()
+                    respond(fd: client, ["ok": true])
+                case "snapshot":
+                    let name = req["name"] as? String ?? "snapshot"
+                    try await snapshotVM(name: name)
+                    respond(fd: client, ["ok": true, "name": name])
+                case "restore":
+                    let name = req["name"] as? String ?? "snapshot"
+                    try restoreVM(name: name)
+                    respond(fd: client, ["ok": true])
+                case "kill":
+                    respond(fd: client, ["ok": true])
+                    shutdown()
+                default:
+                    respond(fd: client, ["ok": false, "error": "unknown op \(op)"])
+                }
+            } catch {
+                respond(fd: client, ["ok": false, "error": error.localizedDescription])
             }
-            let req = try Wire.parse(line)
-            let op = req["op"] as? String ?? ""
-            switch op {
-            case "status":
-                var info: [String: Any] = ["ok": true, "pid": getpid(), "state": machineStateString()]
-                if let bootError = self.bootError { info["boot_error"] = bootError }
-                respond(fd: client, info)
-            case "pause":
-                try pauseVM()
-                respond(fd: client, ["ok": true])
-            case "resume":
-                try resumeVM()
-                respond(fd: client, ["ok": true])
-            case "snapshot":
-                let name = req["name"] as? String ?? "snapshot"
-                try snapshotVM(name: name)
-                respond(fd: client, ["ok": true, "name": name])
-            case "restore":
-                let name = req["name"] as? String ?? "snapshot"
-                try restoreVM(name: name)
-                respond(fd: client, ["ok": true])
-            case "kill":
-                respond(fd: client, ["ok": true])
-                shutdown()
-            default:
-                respond(fd: client, ["ok": false, "error": "unknown op \(op)"])
-            }
-        } catch {
-            respond(fd: client, ["ok": false, "error": error.localizedDescription])
         }
     }
 
@@ -495,78 +494,54 @@ final class VMManager {
         }
     }
 
-    // handle() runs on the main thread / main runloop, so VZ calls are already
-    // in the framework's required thread+runloop context. pause() / resume()
-    // are `NS_REFINED_FOR_SWIFT` (Swift `async`), and saveMachineStateTo keeps a
-    // completion-block form -- both deliver their completion through the main
-    // runloop, so we spin the runloop in short turns until the result arrives.
-    // This is the proven-safe pattern on this host: earlier designs that called
-    // VZ from a background socket thread, or hopped pauses onto DispatchQueue
-    // .main under dispatchMain(), trapped with SIGTRAP in mach-message delivery.
+    // serve() runs each command as a Task on the main queue under dispatchMain().
+    // pause() / resume() are `NS_REFINED_FOR_SWIFT` (Swift `async`), and
+    // saveMachineStateTo keeps a completion-block form (bridged below).
 
-    /// Block on `body`'s completion callback while keeping the main runloop alive.
-    private func runVM(_ body: (@escaping (Error?) -> Void) -> Void) throws {
-        var doneFlag = false
-        var captured: Error?
-        body { error in
-            captured = error
-            doneFlag = true
-        }
-        let rl = RunLoop.current
-        while !doneFlag {
-            _ = rl.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
-        }
-        if let error = captured { throw VZRError.vm(error.localizedDescription) }
-    }
+    // The async VZ calls resume their continuations on the main queue; since
+    // serve() runs handlers as Tasks on that same queue under dispatchMain(),
+    // `await`-ing pause/resume/save here is the proven-safe pattern on this host
+    // (macOS 26 / Swift 6.3): no nested runloop re-entry, no cross-thread trap.
 
-    /// Block on an async VZ call (pause/resume/stop) on the main runloop.
-    private func runVMAsync(_ body: @escaping () async throws -> Void) throws {
-        try runVM { done in
-            Task {
-                do { try await body(); done(nil) }
-                catch { done(error) }
-            }
-        }
-    }
-
-    private func pauseVM() throws {
+    private func pauseVM() async throws {
         guard let vm = machine, vm.canPause else {
             throw VZRError.vm("VM is not in a pausable state (state=\(machineStateString()))")
         }
-        try runVMAsync { try await vm.pause() }
+        try await vm.pause()
     }
 
-    private func resumeVM() throws {
+    private func resumeVM() async throws {
         guard let vm = machine, vm.canResume else {
             throw VZRError.vm("VM is not paused (state=\(machineStateString()))")
         }
-        try runVMAsync { try await vm.resume() }
+        try await vm.resume()
     }
 
-    private func snapshotVM(name: String) throws {
+    /// Bridge the completion-block saveMachineStateTo into async on the main queue.
+    private func saveMachineState(to url: URL) async throws {
+        guard let vm = machine else { throw VZRError.vm("no VM running") }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            vm.saveMachineStateTo(url: url) { (error: Error?) in
+                if let error = error { cont.resume(throwing: error) }
+                else { cont.resume(returning: ()) }
+            }
+        }
+    }
+
+    private func snapshotVM(name: String) async throws {
         guard machine != nil else { throw VZRError.vm("no VM running") }
         if #available(macOS 14.0, *) {
-            // Save machine state (RAM + vCPU + device) to the snapshot dir, all
-            // on the main thread. saveMachineStateTo auto-pauses internally.
-            let stateURL = bundle.machineState(name)
-            try runVM { done in
-                self.createSnapshotDirIfNeeded(name)
-                guard let vm = self.machine else {
-                    done(VZRError.vm("no VM running")); return
-                }
-                vm.saveMachineStateTo(url: stateURL) { (error: Error?) in
-                    done(error)
-                }
-            }
+            // saveMachineStateTo auto-pauses, writes the whole-VM state
+            // (RAM + vCPU + device), then is resumed below so the parent keeps
+            // running after a snapshot.
+            self.createSnapshotDirIfNeeded(name)
+            try await saveMachineState(to: bundle.machineState(name))
             // Reference the disk via an APFS copy-on-write clone so unchanged
             // blocks stay shared with the live disk image. fork (python-side)
             // later `cp -Rc`'s this whole bundle directory.
-            let src = bundle.disk.path
-            let dst = bundle.snapshotDisk(name).path
-            try cloneFile(src: src, dst: dst)
-            // Resume so the parent sandbox keeps running after a snapshot.
+            try cloneFile(src: bundle.disk.path, dst: bundle.snapshotDisk(name).path)
             if let vm = self.machine, vm.canResume {
-                try runVMAsync { try await vm.resume() }
+                try await vm.resume()
             }
         } else {
             throw VZRError.unsupported("snapshot requires macOS 14+ (saveMachineStateToURL)")
@@ -604,14 +579,16 @@ final class VMManager {
     }
 
     private func shutdown() {
-        if let vm = machine {
-            // stop() is async-throwing on Apple Silicon; fire and continue with
-            // socket/pidfile teardown regardless of the outcome.
-            Task { try? await vm.stop() }
+        let vm = machine
+        // Tear down socket + pidfile, stop the VM, then schedule process exit so
+        // the "ok" reply already written by serve() is flushed to the client.
+        acceptSource?.cancel()
+        try? FileManager.default.removeItem(at: bundle.socket)
+        try? FileManager.default.removeItem(at: bundle.pidfile)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            if let vm = vm { Task { try? await vm.stop() } }
+            exit(0)
         }
-        // End the serve loop; serveLoop tears down socket/pidfile and exits after
-        // the current iteration, which lets the "ok" reply flush to the client.
-        isServing = false
     }
 }
 
@@ -803,17 +780,18 @@ func runManager(bundleArg: String, extraArgs: [String]) throws -> Never {
     // (spawnManager posix_spawns us without POSIX_SPAWN_SETSID).
     _ = setsid()
 
-    // All VZ work runs on the main thread/runloop (the framework asserts on any
-    // cross-thread pause/save on this host), so run() boots the guest here and
-    // serveLoop() pumps the main runloop while servicing the control socket.
+    // Boot the guest on the main thread, then park the main thread in
+    // dispatchMain(). The accept DispatchSource queues each control command as a
+    // Task on the main queue, and async VZ calls resume their continuations on
+    // that same queue -- so every VZ interaction stays on the main queue, which
+    // is the only safe arrangement on this host (see run()).
     do {
         try manager.run(execLine: execLine)
     } catch {
         FileHandle.standardError.write("vzrunner manager: \(error.localizedDescription)\n".data(using: .utf8)!)
         exit(1)
     }
-    manager.serveLoop() // pumps the main runloop; exits the process on kill
-    exit(0)             // unreachable
+    dispatchMain() // never returns
 }
 
 // MARK: - top-level dispatch
